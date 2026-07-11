@@ -1,0 +1,103 @@
+// Vercel Serverless Function: /api/book
+// Принимает заявку на бронь с сайта, отправляет уведомление в Telegram
+// и (опционально, если заданы переменные окружения) сохраняет запись в Supabase.
+//
+// Обязательные переменные окружения (Vercel → Project → Settings → Environment Variables):
+//   TELEGRAM_BOT_TOKEN   — токен бота, выданный @BotFather
+//   TELEGRAM_CHAT_ID     — id чата/канала администратора, куда слать уведомления
+//
+// Необязательные (для сохранения броней в базу — см. supabase/schema.sql):
+//   SUPABASE_URL
+//   SUPABASE_SERVICE_KEY
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const body = req.body || {};
+  const { category, seat, date, dateLabel, duration, price, dayType, name, contact, comment } = body;
+
+  // Базовая валидация
+  if (!category || !seat || !date || !duration || !name || !contact) {
+    return res.status(400).json({ error: 'Не хватает обязательных полей' });
+  }
+  if (typeof name !== 'string' || name.length > 100) {
+    return res.status(400).json({ error: 'Некорректное имя' });
+  }
+  if (typeof contact !== 'string' || contact.length > 100) {
+    return res.status(400).json({ error: 'Некорректный контакт' });
+  }
+
+  const text =
+    `🎮 *Новая бронь GAMERS*\n\n` +
+    `Категория: *${escapeMd(category)}*\n` +
+    `Место: №${escapeMd(String(seat))}\n` +
+    `Дата и время: ${escapeMd(dateLabel || date)}\n` +
+    `Длительность: ${escapeMd(duration)}\n` +
+    `Тариф: ${dayType === 'weekend' ? 'выходной' : 'будни'}${price ? `, ${price} ₽` : ''}\n\n` +
+    `Имя: ${escapeMd(name)}\n` +
+    `Контакт: ${escapeMd(contact)}\n` +
+    (comment ? `Комментарий: ${escapeMd(comment)}\n` : '');
+
+  let telegramOk = false;
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (botToken && chatId) {
+    try {
+      const tgRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text,
+          parse_mode: 'MarkdownV2'
+        })
+      });
+      telegramOk = tgRes.ok;
+      if (!tgRes.ok) {
+        console.error('Telegram error:', await tgRes.text());
+      }
+    } catch (err) {
+      console.error('Telegram fetch failed:', err);
+    }
+  } else {
+    console.warn('TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — уведомление не отправлено.');
+  }
+
+  // Опциональная запись в Supabase (не блокирует ответ пользователю при ошибке)
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+  if (supabaseUrl && supabaseKey) {
+    try {
+      await fetch(`${supabaseUrl}/rest/v1/bookings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          category, seat, session_date: date, duration, price, day_type: dayType,
+          client_name: name, contact, comment, status: 'pending'
+        })
+      });
+    } catch (err) {
+      console.error('Supabase insert failed:', err);
+    }
+  }
+
+  if (!telegramOk && botToken && chatId) {
+    // Telegram был настроен, но запрос не удался — сообщаем клиенту явно
+    return res.status(502).json({ error: 'Не удалось отправить уведомление администратору' });
+  }
+
+  return res.status(200).json({ ok: true });
+}
+
+function escapeMd(str) {
+  return String(str).replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
+}
